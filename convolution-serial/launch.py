@@ -12,6 +12,7 @@ pathImages = '../images/'
 pathKernel = '../kernels/'
 pathResult = '../results/'
 partitions = 1
+nchunks = 1
 
 #Initialize the list of files
 lstImages  = []
@@ -38,7 +39,7 @@ for img in lstImages:
 	(namek, extension) = os.path.splitext(krn)
 	nameimgresults  = namei + namek + '.ppm'
 	nametimeresults = namei + namek + '.txt'
-    cmd = './serialconvolution ' + pathImages + img + ' ' + pathKernel + krn + ' ' + pathResult + nameimgresults + ' ' + str(partitions) + ' >' + pathResult + nametimeresults
-        #    os.system(str)
+    cmd = './conv ' + pathImages + img + ' ' + pathKernel + krn + ' ' + pathResult + nameimgresults + ' ' + str(partitions) +  ' ' + str(nchunks) +  ' > ' + pathResult + nametimeresults
+    os.system(cmd)
     print (cmd)
 

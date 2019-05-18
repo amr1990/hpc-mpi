@@ -32,10 +32,11 @@ struct imagenppm{
 typedef struct imagenppm* ImagenData;
 
 struct senddata{
+    int stat;
     int start;
     int chunk;
-    int *in;
-    int *out;
+    ImagenData in;
+    ImagenData out;
 };
 typedef struct senddata* sendData;
 
@@ -57,6 +58,7 @@ int initfilestore(ImagenData img, FILE **fp, char* nombre, long *position);
 int savingChunk(ImagenData img, FILE **fp, int dim, int offset);
 int convolve2D(int* inbuf, int* outbuf, int sizeX, int sizeY, float* kernel, int ksizeX, int ksizeY);
 void freeImagestructure(ImagenData *src);
+int checkfreepos(int *a);
 
 //Open Image file and image struct initialization
 ImagenData initimage(char* nombre, FILE **fp,int partitions, int halo){
@@ -316,7 +318,7 @@ int main(int argc, char **argv)
     int i=0,j=0,k=0;
 //    int headstored=0, imagestored=0, stored;
     
-    if(argc != 5)
+    if(argc != 6)
     {
         printf("Usage: %s <image-file> <kernel-file> <result-file> <partitions>\n", argv[0]);
         
@@ -338,14 +340,20 @@ int main(int argc, char **argv)
     struct timeval tim;
     FILE *fpsrc=NULL,*fpdst=NULL;
     ImagenData source=NULL, output=NULL;
-    sendData send=NULL, recv=NULL;
+    sendData send=NULL, recv=NULL, senddata=NULL;
 
     MPI_Init(&argc,&argv);
     MPI_Comm_size(MPI_COMM_WORLD,&nprocs);
     MPI_Comm_rank(MPI_COMM_WORLD,&rank);
+
+    MPI_Datatype data;
+    int blocks[5];
+    MPI_Aint indices[5];
+    MPI_Datatype MPItypes[5];
+
     // Store number of partitions
     partitions = atoi(argv[4]);
-    chunk = atoi(argv[]);
+    chunk = atoi(argv[5]);
     ////////////////////////////////////////
     //Reading kernel matrix
     gettimeofday(&tim, NULL);
@@ -395,6 +403,35 @@ int main(int argc, char **argv)
     }
     gettimeofday(&tim, NULL);
     tstore = tstore + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
+
+    // Create struct
+    blocks[0] = 1;
+    blocks[1] = 1;
+    blocks[2] = 1;
+    blocks[3] = 10;
+    blocks[4] = 10;
+
+    MPItypes[0] = MPI_INT;
+    MPItypes[1] = MPI_INT;
+    MPItypes[2] = MPI_INT;
+    MPItypes[3] = MPI_INT;
+    MPItypes[4] = MPI_INT;
+
+    MPI_Get_address( &senddata->stat, &indices[0] );
+    MPI_Get_address( &senddata->start, &indices[1] );
+    MPI_Get_address( &senddata->chunk, &indices[2] );
+    MPI_Get_address( &senddata->in, &indices[3] );
+    MPI_Get_address( &senddata->out, &indices[4] );
+
+    MPI_Aint baseaddres=indices[0];
+    indices[0] = indices[0] - baseaddres;
+    indices[1] = indices[1] - baseaddres;
+    indices[2] = indices[2] - baseaddres;
+    indices[3] = indices[3] - baseaddres;
+    indices[4] = indices[4] - baseaddres;
+
+    MPI_Type_create_struct( 5, blocks, indices, MPItypes, &data );
+    MPI_Type_commit( &data );
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
     // CHUNK READING
@@ -450,6 +487,9 @@ int main(int argc, char **argv)
         gettimeofday(&tim, NULL);
         start = tim.tv_sec+(tim.tv_usec/1000000.0);
 
+        send = (sendData) malloc(sizeof(struct senddata));
+        recv = (sendData) malloc(sizeof(struct senddata));
+
         int p[chunk];
         int partsize = chunk * source->ancho;
         int init = 0;
@@ -459,17 +499,47 @@ int main(int argc, char **argv)
             init = init + partsize;
         }
 
+        send->in = source;
+        send->out = output;
+        MPI_Status status;
+
         if(rank == 0){
             while(curchunk < chunk){
-                MPI_Status status;
-                MPI_Recv((*void) myRecvArr,1,MPI_INT,MPI_ANY_SOURCE,0,MPI_COMM_WORLD,&status);
 
+                MPI_Recv((void *) recv,5,data,status.MPI_SOURCE,0,MPI_COMM_WORLD,&status);
 
+                if(recv->stat == -1){
+                    send->stat = -2;
+                    if(checkfreepos(p) == -1){
+                        send->stat = -1;
+                    }else{
+                        send->start = checkfreepos(p);
+                    }
+                    send->chunk = partsize;
+                    MPI_Send((void *) send,5,data,status.MPI_SOURCE,0,MPI_COMM_WORLD);
+                    curchunk+=1;
+                }else if(recv->stat == -2){
+                    MPI_Recv((void *) recv,5,data,status.MPI_SOURCE,0,MPI_COMM_WORLD,&status);
+                }
             }
         }else{
-            convolve2D(source->R, output->R, source->ancho, (source->altura/partitions)+halosize, kern->vkern, kern->kernelX, kern->kernelY);
-            convolve2D(source->G, output->G, source->ancho, (source->altura/partitions)+halosize, kern->vkern, kern->kernelX, kern->kernelY);
-            convolve2D(source->B, output->B, source->ancho, (source->altura/partitions)+halosize, kern->vkern, kern->kernelX, kern->kernelY);
+            while (1){
+                send->stat = -1;
+                MPI_Send((void *) send,5,data,0,0,MPI_COMM_WORLD);
+                MPI_Recv((void *) recv,5,data,0,0,MPI_COMM_WORLD,&status);
+                if(recv->stat == -1){
+                    break;
+                }else{
+                    convolve2D(recv->in->R, recv->out->R, recv->in->ancho, (recv->in->altura/partitions)+halosize, kern->vkern, kern->kernelX, kern->kernelY);
+                    convolve2D(recv->in->G, recv->out->G, recv->in->ancho, (recv->in->altura/partitions)+halosize, kern->vkern, kern->kernelX, kern->kernelY);
+                    convolve2D(recv->in->B, recv->out->B, recv->in->ancho, (recv->in->altura/partitions)+halosize, kern->vkern, kern->kernelX, kern->kernelY);
+
+                    send->stat = -2;
+                    send->out = recv->out;
+                    MPI_Send((void *) send,5,data,0,0,MPI_COMM_WORLD);
+
+                }
+            }
         }
 
         
@@ -516,4 +586,17 @@ int main(int argc, char **argv)
     printf("%.6lf seconds elapsed\n", tend-tstart);
     MPI_Finalize();
     return 0;
+}
+
+int checkfreepos(int *a){
+    int freepos = -1, i = 0;
+
+    for(i = 0; i < sizeof(a); i++){
+        if(a[i] >= 0){
+            freepos = a[i];
+            a[i] = -1;
+        }
+    }
+
+    return freepos;
 }
