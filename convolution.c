@@ -31,13 +31,6 @@ struct imagenppm{
 };
 typedef struct imagenppm* ImagenData;
 
-struct senddata{
-    int stat;
-    int start;
-    int chunk;
-};
-typedef struct senddata* sendData;
-
 // Estructura per emmagatzemar el contingut d'un kernel.
 struct structkernel{
     int kernelX;
@@ -54,9 +47,8 @@ int readImage(ImagenData Img, FILE **fp, int dim, int halosize, long int *positi
 int duplicateImageChunk(ImagenData src, ImagenData dst, int dim);
 int initfilestore(ImagenData img, FILE **fp, char* nombre, long *position);
 int savingChunk(ImagenData img, FILE **fp, int dim, int offset);
-int convolve2D(int* inbuf, int* outbuf, int sizeX, int sizeY, float* kernel, int ksizeX, int ksizeY, int chunk, int part);
+int convolve2D(int* inbuf, int* outbuf, int sizeX, int sizeY, float* kernel, int ksizeX, int ksizeY);
 void freeImagestructure(ImagenData *src);
-int checkfreepos(int *a);
 
 //Open Image file and image struct initialization
 ImagenData initimage(char* nombre, FILE **fp,int partitions, int halo){
@@ -230,7 +222,7 @@ void freeImagestructure(ImagenData *src){
 // signed integer (32bit) version:
 ///////////////////////////////////////////////////////////////////////////////
 int convolve2D(int* in, int* out, int dataSizeX, int dataSizeY,
-               float* kernel, int kernelSizeX, int kernelSizeY, int chunk, int part)
+               float* kernel, int kernelSizeX, int kernelSizeY)
 {
     int i, j, m, n;
     int *inPtr, *inPtr2, *outPtr;
@@ -254,13 +246,13 @@ int convolve2D(int* in, int* out, int dataSizeX, int dataSizeY,
     kPtr = kernel;
 
     // start convolution
-    for(i= chunk; i < dataSizeY; ++i)                   // number of rows
+    for(i= 0; i < dataSizeY; ++i)                   // number of rows
     {
         // compute the range of convolution, the current row of kernel should be between these
         rowMax = i + kCenterY;
         rowMin = i - dataSizeY + kCenterY;
 
-        for(j = 0; j < chunk+part; ++j)              // number of columns
+        for(j = 0; j < dataSizeX; ++j)              // number of columns
         {
             // compute the range of convolution, the current column of kernel should be between these
             colMax = j + kCenterX;
@@ -293,7 +285,7 @@ int convolve2D(int* in, int* out, int dataSizeX, int dataSizeY,
             // convert integer number
             if(sum >= 0) *outPtr = (int)(sum + 0.5f);
 //            else *outPtr = (int)(sum - 0.5f)*(-1);
-            // For using with image editors like GIMP or others...
+                // For using with image editors like GIMP or others...
             else *outPtr = (int)(sum - 0.5f);
             // For using with a text editor that read ppm images like libreoffice or others...
 //            else *outPtr = 0;
@@ -314,9 +306,10 @@ int convolve2D(int* in, int* out, int dataSizeX, int dataSizeY,
 int main(int argc, char **argv)
 {
     int i=0,j=0,k=0;
+    int rank, nprocs;
 //    int headstored=0, imagestored=0, stored;
 
-    if(argc != 6)
+    if(argc != 5)
     {
         printf("Usage: %s <image-file> <kernel-file> <result-file> <partitions>\n", argv[0]);
 
@@ -332,28 +325,15 @@ int main(int argc, char **argv)
     //////////////////////////////////////////////////////////////////////////////////////////////////
     // READING IMAGE HEADERS, KERNEL Matrix, DUPLICATE IMAGE DATA, OPEN RESULTING IMAGE FILE
     //////////////////////////////////////////////////////////////////////////////////////////////////
-    int imagesize, partitions, partsize, chunksize, halo, halosize, nprocs, rank, chunk;
+    int imagesize, partitions, partsize, chunksize, halo, halosize;
     long position=0;
     double start, tstart=0, tend=0, tread=0, tcopy=0, tconv=0, tstore=0, treadk=0;
     struct timeval tim;
     FILE *fpsrc=NULL,*fpdst=NULL;
     ImagenData source=NULL, output=NULL;
-    sendData senddata;
-
-    senddata = (sendData) malloc(sizeof(struct senddata));
-
-    MPI_Datatype data;
-    int blocks[3];
-    MPI_Aint indices[3];
-    MPI_Datatype MPItypes[3];
-
-    MPI_Init(&argc,&argv);
-    MPI_Comm_size(MPI_COMM_WORLD,&nprocs);
-    MPI_Comm_rank(MPI_COMM_WORLD,&rank);
 
     // Store number of partitions
     partitions = atoi(argv[4]);
-    chunk = atoi(argv[5]);
     ////////////////////////////////////////
     //Reading kernel matrix
     gettimeofday(&tim, NULL);
@@ -401,30 +381,8 @@ int main(int argc, char **argv)
         //        free(output);
         return -1;
     }
-    printf("hola\n");
     gettimeofday(&tim, NULL);
     tstore = tstore + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
-
-    // Create struct
-    blocks[0] = 1;
-    blocks[1] = 1;
-    blocks[2] = 1;
-
-    MPItypes[0] = MPI_INT;
-    MPItypes[1] = MPI_INT;
-    MPItypes[2] = MPI_INT;
-
-    MPI_Get_address( &senddata->stat, &indices[0] );
-    MPI_Get_address( &senddata->start, &indices[1] );
-    MPI_Get_address( &senddata->chunk, &indices[2] );
-
-    MPI_Aint baseaddres=indices[0];
-    indices[0] = indices[0] - baseaddres;
-    indices[1] = indices[1] - baseaddres;
-    indices[2] = indices[2] - baseaddres;
-
-    MPI_Type_create_struct( 3, blocks, indices, MPItypes, &data );
-    MPI_Type_commit( &data );
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
     // CHUNK READING
@@ -432,159 +390,178 @@ int main(int argc, char **argv)
     int c=0, offset=0;
     imagesize = source->altura*source->ancho;
     partsize  = (source->altura*source->ancho)/partitions;
-    printf("%s ocupa %dx%d=%d pixels. Partitions=%d, halo=%d, partsize=%d pixels\n", argv[1], source->altura, source->ancho, imagesize, partitions, halo, partsize);
+
+    int Ksize = kern->kernelX * kern->kernelY;
+
+    MPI_Init( &argc, &argv );
+
+    MPI_Comm_rank( MPI_COMM_WORLD, &rank );
+    MPI_Comm_size( MPI_COMM_WORLD, &nprocs);
+//    printf("%s ocupa %dx%d=%d pixels. Partitions=%d, halo=%d, partsize=%d pixels\n", argv[1], source->altura, source->ancho, imagesize, partitions, halo, partsize);
     while (c < partitions) {
-        ////////////////////////////////////////////////////////////////////////////////
-        //Reading Next chunk.
-        gettimeofday(&tim, NULL);
-        start = tim.tv_sec+(tim.tv_usec/1000000.0);
-        if (c==0) {
-            halosize  = halo/2;
-            chunksize = partsize + (source->ancho*halosize);
-            offset   = 0;
-        }
-        else if(c<partitions-1) {
-            halosize  = halo;
-            chunksize = partsize + (source->ancho*halosize);
-            offset    = (source->ancho*halo/2);
-        }
-        else {
-            halosize  = halo/2;
-            chunksize = partsize + (source->ancho*halosize);
-            offset    = (source->ancho*halo/2);
-        }
-        //DEBUG
-        printf("\nRound = %d, position = %ld, partsize= %d, chunksize=%d pixels\n", c, position, partsize, chunksize);
+        int dataSizeX, dataSizeY, kernelSizeX, kernelSizeY, size = 0, isize;
+        int *sourceRin, *sourceGin, *sourceBin, *sourceRout, *sourceGout, *sourceBout, *Rin, *Rout, *Gin, *Gout, *Bin, *Bout, *Ro, *Go, *Bo;
+        float *vkern = malloc(Ksize * sizeof(float));
 
-        if (readImage(source, &fpsrc, chunksize, halo/2, &position)) {
-            return -1;
-        }
-        gettimeofday(&tim, NULL);
-        tread = tread + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
-
-        //Duplicate the image chunk
-        gettimeofday(&tim, NULL);
-        start = tim.tv_sec+(tim.tv_usec/1000000.0);
-        if ( duplicateImageChunk(source, output, chunksize) ) {
-            return -1;
-        }
-        //DEBUG
-       for (i=0;i<chunksize;i++)
-          if (source->R[i]!=output->R[i] || source->G[i]!=output->G[i] || source->B[i]!=output->B[i]) printf("At position i=%d %d!=%d,%d!=%d,%d!=%d\n",i,source->R[i],output->R[i], source->G[i],output->G[i],source->B[i],output->B[i]);
-        gettimeofday(&tim, NULL);
-        tcopy = tcopy + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
-
-        //////////////////////////////////////////////////////////////////////////////////////////////////
-        // CHUNK CONVOLUTION
-        //////////////////////////////////////////////////////////////////////////////////////////////////
-        gettimeofday(&tim, NULL);
-        start = tim.tv_sec+(tim.tv_usec/1000000.0);
-
-
-
-        int p[chunk];
-        int partsize = chunk * source->ancho;
-        int init = 0;
-        int curchunk = 0;
-        for (i = 0; i < chunk; i++){
-            p[i] = init;
-            init = init + partsize;
-        }
-
-        if(rank == 0){
-            MPI_Status status;
-            while(curchunk < chunk){
-                MPI_Recv((void *) senddata,3,data,MPI_ANY_SOURCE,0,MPI_COMM_WORLD,&status);
-
-                if(senddata->stat == -1){
-                    senddata->stat = -2;
-                    if(checkfreepos(p) == -1){
-                        senddata->stat = -1;
-                    }else{
-                        senddata->start = checkfreepos(p);
-                    }
-                    senddata->chunk = partsize;
-                    MPI_Send((void *) senddata,3,data,status.MPI_SOURCE,0,MPI_COMM_WORLD);
-                    curchunk+=1;
-                }else if(senddata->stat == -2){
-                    MPI_Recv((void *) senddata,3,data,MPI_ANY_SOURCE,0,MPI_COMM_WORLD,&status);
-                }
+        if (rank == 0) {
+            start = MPI_Wtime();
+            ////////////////////////////////////////////////////////////////////////////////
+            //Reading Next chunk.
+            gettimeofday(&tim, NULL);
+            start = tim.tv_sec + (tim.tv_usec / 1000000.0);
+            if (c == 0) {
+                halosize = halo / 2;
+                chunksize = partsize + (source->ancho * halosize);
+                offset = 0;
+            } else if (c < partitions - 1) {
+                halosize = halo;
+                chunksize = partsize + (source->ancho * halosize);
+                offset = (source->ancho * halo / 2);
+            } else {
+                halosize = halo / 2;
+                chunksize = partsize + (source->ancho * halosize);
+                offset = (source->ancho * halo / 2);
             }
-        }else{
-            MPI_Status status;
-            while (1){
-                senddata->stat = -1;
-                MPI_Send((void *) senddata,3,data,0,0,MPI_COMM_WORLD);
-                MPI_Recv((void *) senddata,3,data,0,0,MPI_COMM_WORLD,&status);
-                if(senddata->stat == -1){
-                    break;
-                }else{
-                    convolve2D(source->R, output->R, source->ancho, (source->altura/partitions)+halosize, kern->vkern, kern->kernelX, kern->kernelY, senddata->start, senddata->chunk);
-                    convolve2D(source->G, output->G, source->ancho, (source->altura/partitions)+halosize, kern->vkern, kern->kernelX, kern->kernelY, senddata->start, senddata->chunk);
-                    convolve2D(source->B, output->B, source->ancho, (source->altura/partitions)+halosize, kern->vkern, kern->kernelX, kern->kernelY, senddata->start, senddata->chunk);
+            //DEBUG
+//        printf("\nRound = %d, position = %ld, partsize= %d, chunksize=%d pixels\n", c, position, partsize, chunksize);
 
-                    senddata->stat = -2;
-                    MPI_Send((void *) senddata,3,data,0,0,MPI_COMM_WORLD);
-
-                }
+            if (readImage(source, &fpsrc, chunksize, halo / 2, &position)) {
+                return -1;
             }
+
+            start = MPI_Wtime();
+
+            //Duplicate the image chunk
+            if (duplicateImageChunk(source, output, chunksize)) {
+                return -1;
+            }
+            //DEBUG
+//        for (i=0;i<chunksize;i++)
+//            if (source->R[i]!=output->R[i] || source->G[i]!=output->G[i] || source->B[i]!=output->B[i]) printf("At position i=%d %d!=%d,%d!=%d,%d!=%d\n",i,source->R[i],output->R[i], source->G[i],output->G[i],source->B[i],output->B[i]);
+            gettimeofday(&tim, NULL);
+            tcopy = tcopy + (MPI_Wtime() - start);
+
+            start = MPI_Wtime();
+
+
+            size = source->altura / nprocs;
+
+            dataSizeX = source->ancho;
+            dataSizeY = (source->altura / partitions) + halosize;
+            vkern = kern->vkern;
+            kernelSizeX = kern->kernelX;
+            kernelSizeY = kern->kernelY;
+
+            Rout = malloc(sizeof(int) * dataSizeX * dataSizeY);
+            Gout = malloc(sizeof(int) * dataSizeX * dataSizeY);
+            Bout = malloc(sizeof(int) * dataSizeX * dataSizeY);
+
+            sourceRin = source->R;
+            sourceGin = source->G;
+            sourceBin = source->B;
+
+            sourceRout = output->R;
+            sourceGout = output->G;
+            sourceBout = output->B;
         }
 
 
-        gettimeofday(&tim, NULL);
-        tconv = tconv + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
+        MPI_Bcast(&size, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&dataSizeX, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&dataSizeY, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-        //////////////////////////////////////////////////////////////////////////////////////////////////
-        // CHUNK SAVING
-        //////////////////////////////////////////////////////////////////////////////////////////////////
-        //Storing resulting image partition.
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        isize = size * dataSizeX;
+
+        Rin = malloc(isize * sizeof(int));
+        Gin = malloc(isize * sizeof(int));
+        Bin = malloc(isize * sizeof(int));
+
+        Ro = malloc(isize * sizeof(int));
+        Go = malloc(isize * sizeof(int));
+        Bo = malloc(isize * sizeof(int));
+
+        MPI_Scatter(sourceRin, isize, MPI_INT, Rin, isize, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Scatter(sourceGin, isize, MPI_INT, Gin, isize, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Scatter(sourceBin, isize, MPI_INT, Bin, isize, MPI_INT, 0, MPI_COMM_WORLD);
+
+        MPI_Scatter(sourceRout, isize, MPI_INT, Ro, isize, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Scatter(sourceGout, isize, MPI_INT, Go, isize, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Scatter(sourceBout, isize, MPI_INT, Bo, isize, MPI_INT, 0, MPI_COMM_WORLD);
+
+        MPI_Barrier(MPI_COMM_WORLD);
+
         gettimeofday(&tim, NULL);
-        start = tim.tv_sec+(tim.tv_usec/1000000.0);
-        if (savingChunk(output, &fpdst, partsize, offset)) {
-            perror("Error: ");
-            //        free(source);
-            //        free(output);
-            return -1;
+        start = tim.tv_sec + (tim.tv_usec / 1000000.0);
+
+        convolve2D(Rin, Ro, dataSizeX, size, kern->vkern, kern->kernelX, kern->kernelY);
+        convolve2D(Gin, Go, dataSizeX, size, kern->vkern, kern->kernelX, kern->kernelY);
+        convolve2D(Bin, Bo, dataSizeX, size, kern->vkern, kern->kernelX, kern->kernelY);
+
+        MPI_Barrier(MPI_COMM_WORLD);
+
+
+        MPI_Gather(Ro, isize, MPI_INT, Rout, isize, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Gather(Go, isize, MPI_INT, Gout, isize, MPI_INT, 0, MPI_COMM_WORLD);
+        MPI_Gather(Bo, isize, MPI_INT, Bout, isize, MPI_INT, 0, MPI_COMM_WORLD);
+
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        if (rank == 0) {
+            output->R = Rout;
+            output->G = Gout;
+            output->B = Bout;
+
+            tconv = tconv + (MPI_Wtime() - start);
+
+            gettimeofday(&tim, NULL);
+
+            //////////////////////////////////////////////////////////////////////////////////////////////////
+            // CHUNK SAVING
+            //////////////////////////////////////////////////////////////////////////////////////////////////
+            //Storing resulting image partition.
+            start = MPI_Wtime();
+
+            if (savingChunk(output, &fpdst, partsize, offset)) {
+                perror("Error: ");
+                //        free(source);
+                //        free(output);
+                return -1;
+            }
+
+            tstore = tstore + (MPI_Wtime() - start);
+
+            gettimeofday(&tim, NULL);
+            tstore = tstore + (tim.tv_sec + (tim.tv_usec / 1000000.0) - start);
+            //Next partition
+            c++;
         }
-        gettimeofday(&tim, NULL);
-        tstore = tstore + (tim.tv_sec+(tim.tv_usec/1000000.0) - start);
-        //Next partition
-        c++;
+        MPI_Bcast(&c, 1, MPI_INT, 0, MPI_COMM_WORLD);
     }
 
-    fclose(fpsrc);
-    fclose(fpdst);
+    if(rank == 0) {
+        fclose(fpsrc);
+        fclose(fpdst);
 
-    freeImagestructure(&source);
-    freeImagestructure(&output);
+        freeImagestructure(&source);
+        freeImagestructure(&output);
 
-    gettimeofday(&tim, NULL);
-    tend = tim.tv_sec+(tim.tv_usec/1000000.0);
+        gettimeofday(&tim, NULL);
+        tend = tim.tv_sec + (tim.tv_usec / 1000000.0);
 
-    printf("Imatge: %s\n", argv[1]);
-    printf("ISizeX : %d\n", source->ancho);
-    printf("ISizeY : %d\n", source->altura);
-    printf("kSizeX : %d\n", kern->kernelX);
-    printf("kSizeY : %d\n", kern->kernelY);
-    printf("%.6lf seconds elapsed for Reading image file.\n", tread);
-    printf("%.6lf seconds elapsed for copying image structure.\n", tcopy);
-    printf("%.6lf seconds elapsed for Reading kernel matrix.\n", treadk);
-    printf("%.6lf seconds elapsed for make the convolution.\n", tconv);
-    printf("%.6lf seconds elapsed for writing the resulting image.\n", tstore);
-    printf("%.6lf seconds elapsed\n", tend-tstart);
+        printf("Imatge: %s\n", argv[1]);
+        printf("ISizeX : %d\n", source->ancho);
+        printf("ISizeY : %d\n", source->altura);
+        printf("kSizeX : %d\n", kern->kernelX);
+        printf("kSizeY : %d\n", kern->kernelY);
+        printf("%.6lf seconds elapsed for Reading image file.\n", tread);
+        printf("%.6lf seconds elapsed for copying image structure.\n", tcopy);
+        printf("%.6lf seconds elapsed for Reading kernel matrix.\n", treadk);
+        printf("%.6lf seconds elapsed for make the convolution.\n", tconv);
+        printf("%.6lf seconds elapsed for writing the resulting image.\n", tstore);
+        printf("%.6lf seconds elapsed\n", tend - tstart);
+    }
     MPI_Finalize();
     return 0;
-}
-
-int checkfreepos(int *a){
-    int freepos = -1, i = 0;
-
-    for(i = 0; i < sizeof(a); i++){
-        if(a[i] >= 0){
-            freepos = a[i];
-            a[i] = -1;
-        }
-    }
-
-    return freepos;
 }
